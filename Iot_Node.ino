@@ -1,50 +1,141 @@
+#include <Wire.h>
+#include <Adafruit_PN532.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <MFRC522.h>
 #include <ESP32Servo.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
-#define SS_PIN 5   // SDA for RFID
-#define RST_PIN 4  // RST for RFID
-
+// Pin Definitions
 #define BUTTON_INTENSO_PIN 14  // Button for "Intenso"
+#define BUZZER_PIN 15         // Buzzer GPIO
+#define SERVO_PIN 13          // Servo GPIO
 
-#define BUZZER_PIN 15  // Buzzer GPIO
-#define SERVO_PIN 13   // Servo GPIO
+// PN532 Pins
+#define PN532_SCK (18)
+#define PN532_MISO (19)
+#define PN532_MOSI (23)
+#define PN532_SS (27)
 
 // RFID reader instance
-MFRC522 rfid(SS_PIN, RST_PIN);
+Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 // Servo instance
 Servo myServo;
 
 // WiFi credentials
-const char* ssid = "your-SSID";
-const char* password = "your-PASSWORD";
+const char* ssid = "test";
+const char* password = "12345678";
 
 // Backend endpoints
-const char* backend_verify_url = "http://192.168.1.18:8000/api/verify-rfid";
-const char* backend_coffee_url = "http://192.168.1.18:8000/api/select-coffee";
-//Machine Location
-const char* machineLocation = "Office Floor 1";
+const char* backend_verify_url = "http://10.0.22.54:8000/api/verify-rfid";
+const char* backend_coffee_url = "http://10.0.22.54:8000/api/select-coffee";
+// Machine Location
+const char* machineLocation = "Office A - Floor 1";
+
 // Variables
-bool accessGranted = false;
-unsigned long startTime = 0;
-bool buttonPressed = false;
+volatile bool accessGranted = false;
+volatile bool buttonPressed = false;
 String selectedCoffee = "";
 String currentTagID = "";
+unsigned long startTime = 0;
+
+// Timer for timeout
+esp_timer_handle_t timeout_timer;
+
+// Task handles
+TaskHandle_t RFIDTaskHandle = NULL;
+TaskHandle_t ButtonTaskHandle = NULL;
+
+// Timer callback for checking timeout
+void IRAM_ATTR timeout_callback(void* arg) {
+  if (accessGranted) {
+    Serial.println("Timeout! Please pass the RFID tag again.");
+    resetSystem();
+  }
+}
+
+// Interrupt service routine (ISR) for button press
+void IRAM_ATTR buttonISR() {
+  if (accessGranted && digitalRead(BUTTON_INTENSO_PIN) == LOW) {
+    selectedCoffee = "Intenso";
+    buttonPressed = true;
+  }
+}
+// Variables to track button press timeout
+unsigned long buttonPressStartTime = 0;
+const unsigned long buttonPressTimeout = 10000;  // 10 seconds timeout for button press
+
+// RFID Task: Handles RFID reading
+void RFID_Task(void *pvParameters) {
+  while (1) {
+    uint8_t success;
+    uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  // Buffer to store the returned UID
+    uint8_t uidLength;                        // Length of the UID (4 or 7 bytes depending on card type)
+
+    success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
+    if (success) {
+      currentTagID = getRFIDTag(uid, uidLength);
+      Serial.println("RFID Tag detected: " + currentTagID);
+
+      // Verify tag with backend
+      if (verifyTagWithBackend(currentTagID)) {
+        Serial.println("Access Granted. Waiting for button press...");
+        accessGranted = true;
+        buttonPressStartTime = millis();  // Start the 10-second timer
+        esp_timer_stop(timeout_timer);  // Stop the timer while waiting for button press
+      } else {
+        Serial.println("Access Denied.");
+        buzzFor(5000);  // Buzz for 5 seconds if unauthorized
+        accessGranted = false;
+      }
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);  // Yield to other tasks
+  }
+}
+
+// Button Task: Handles button press logic
+void Button_Task(void *pvParameters) {
+  while (1) {
+    if (accessGranted) {
+      // Check if button press timeout is exceeded
+      unsigned long currentMillis = millis();
+      if (currentMillis - buttonPressStartTime > buttonPressTimeout) {
+        Serial.println("Timeout! Please pass the RFID tag again.");
+        resetSystem();
+      }
+
+      if (buttonPressed) {
+        buttonPressed = false;
+        Serial.println("Button pressed, sending coffee selection...");
+        sendCoffeeSelectionToBackend(currentTagID, selectedCoffee);
+        activateServo();
+        resetSystem();
+      }
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);  // Yield to other tasks
+  }
+}
 
 void setup() {
   Serial.begin(115200);
 
-  // Initialize RFID
-  SPI.begin();
-  rfid.PCD_Init();
+  // Initialize PN532
+  nfc.begin();
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (!versiondata) {
+    Serial.println("Didn't find PN532 board");
+    while (1) ;  // Halt
+  }
+  nfc.SAMConfig();  // Configure the RFID reader
 
   // Initialize Servo
   myServo.attach(SERVO_PIN);
   myServo.write(0);  // Initial position
 
-  // Set buttons as input
+  // Set buttons as input and attach interrupt
   pinMode(BUTTON_INTENSO_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_INTENSO_PIN), buttonISR, FALLING);
 
   // Set buzzer as output
   pinMode(BUZZER_PIN, OUTPUT);
@@ -53,63 +144,31 @@ void setup() {
   // Connect to Wi-Fi
   connectToWiFi();
 
+  // Set up timer for timeout (10 seconds)
+  esp_timer_create_args_t timer_args;
+  timer_args.callback = timeout_callback;
+  timer_args.arg = NULL;
+  timer_args.dispatch_method = ESP_TIMER_TASK;
+  timer_args.name = "Timeout Timer";
+  esp_timer_create(&timer_args, &timeout_timer);
+  esp_timer_start_once(timeout_timer, 10000 * 1000);  // 10 seconds in microseconds
+
+  // Create FreeRTOS tasks
+  xTaskCreatePinnedToCore(RFID_Task, "RFID Task", 4096, NULL, 1, &RFIDTaskHandle, 0);
+  xTaskCreatePinnedToCore(Button_Task, "Button Task", 4096, NULL, 1, &ButtonTaskHandle, 1);
+
   Serial.println("Ready to scan RFID tag...");
 }
 
 void loop() {
-   // Debug: Check the button state
- int buttonState = digitalRead(BUTTON_INTENSO_PIN);
- // Serial.println("Button State: " + String(buttonState));  // Debugging button state
-
-  // Check for a new RFID card
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    currentTagID = getRFIDTag();
-    Serial.println("RFID Tag detected: " + currentTagID);
-
-    // Verify tag with backend
-    if (verifyTagWithBackend(currentTagID)) {
-      Serial.println("Access Granted. Waiting for button press...");
-      accessGranted = true;
-      startTime = millis();  // Start 10-second timer
-    } else {
-      Serial.println("Access Denied.");
-      buzzFor(5000);  // Buzz for 5 seconds if unauthorized
-      accessGranted = false;
-    }
-    rfid.PICC_HaltA();
-  }
-
-  // Check if access was granted and handle button presses
-  if (accessGranted) {
-    unsigned long elapsedTime = millis() - startTime;
-    
-   // Serial.println(buttonState);
-    // Check if any button is pressed
-    if (digitalRead(BUTTON_INTENSO_PIN) == LOW) {
-      selectedCoffee = "Intenso";
-      buttonPressed = true;
-      Serial.println("Button pressed, sending coffee selection...");
-    }else{
-      buttonPressed = false;
-    }
-    // If a button is pressed within 10 seconds, send the coffee type and activate the servo
-    if (buttonPressed && elapsedTime <= 10000) {
-      Serial.println("Selected coffee: " + selectedCoffee);
-      sendCoffeeSelectionToBackend(currentTagID, selectedCoffee);
-      activateServo();
-      resetSystem();
-    } else if (elapsedTime > 10000) {
-      Serial.println("Timeout! Please pass the RFID tag again.");
-      resetSystem();
-    }
-  }
+  // Main loop can be empty since tasks are running in parallel
 }
 
-// Function to get RFID tag ID
-String getRFIDTag() {
+// Function to get RFID tag ID from the PN532
+String getRFIDTag(uint8_t* uid, uint8_t uidLength) {
   String tagID = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    tagID += String(rfid.uid.uidByte[i], HEX);
+  for (uint8_t i = 0; i < uidLength; i++) {
+    tagID += String(uid[i], HEX);
   }
   return tagID;
 }
@@ -119,22 +178,18 @@ bool verifyTagWithBackend(String tagID) {
   HTTPClient http;
   String fullUrl = String(backend_verify_url) + "?rfid_tag=" + tagID;
 
-
   http.begin(fullUrl);  // Add tag as query parameter
-
   int httpCode = http.GET();
-  Serial.println("HTTP Code: " + String(httpCode));
 
   if (httpCode == 200) {  // HTTP OK
     String response = http.getString();
-    Serial.println("Backend response: " + response);
-    // Parse JSON response (assuming backend returns a JSON response)
     if (response.indexOf("success\":true") >= 0) {
+      http.end();  // Close the connection properly
       return true;
     }
+  } else {
+    http.end();  // Close the connection properly
   }
-  String response = http.getString();
-  Serial.println("Backend response: " + response);
   return false;
 }
 
@@ -142,32 +197,19 @@ bool verifyTagWithBackend(String tagID) {
 void sendCoffeeSelectionToBackend(String tagID, String coffeeType) {
   HTTPClient http;
   http.begin(backend_coffee_url);  // Coffee selection endpoint
-  Serial.println(backend_coffee_url);
+
   // Set content type to JSON
   http.addHeader("Content-Type", "application/json");
 
   // Create JSON payload
-  String payload = "{\"rfid_tag\":\"" + String(tagID) +"\" ,\"coffee_type\":\"" + String(coffeeType) + "\", \"machine_location\":\"" + String(machineLocation) + "\"}";
- 
-  // Send POST request
-  // Debug: Print the payload
-  Serial.println("Sending payload: " + payload);
+  String payload = "{\"rfid_tag\":\"" + tagID + "\",\"coffee_type\":\"" + coffeeType + "\", \"machine_location\":\"" + String(machineLocation) + "\"}";
+
   int httpCode = http.POST(payload);
 
-  // Check if the response is a redirect
-  if (httpCode == 302) {
-    String response = http.getString();
-    Serial.println("Backend response: " + response);
-    String redirectURL = http.getLocation();  // Get redirect URL from Location header
-    Serial.println("HTTP Code: 302, Redirecting to: " + redirectURL);
-  } else {
-    String response = http.getString();  // Get the response from server
-    Serial.println("HTTP Code: " + String(httpCode));
-    Serial.println("Backend response: " + response);
-  }
   if (httpCode == 200) {
     Serial.println("Coffee selection sent successfully.");
   } else {
+    //Serial.println(http.getString());
     Serial.println("Failed to send coffee selection.");
   }
 
@@ -191,11 +233,13 @@ void buzzFor(int duration) {
 // Function to reset the system state
 void resetSystem() {
   accessGranted = false;
-  buttonPressed = false;
   selectedCoffee = "";
   currentTagID = "";
-  startTime = 0;
+  buttonPressStartTime = 0;  // Reset button press timer
   Serial.println("System reset. Please scan RFID again.");
+
+  // Restart the timer for the next session
+  esp_timer_start_once(timeout_timer, 10000 * 1000);  // 10 seconds in microseconds
 }
 
 // Function to connect to Wi-Fi
