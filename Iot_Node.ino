@@ -28,8 +28,8 @@ const char* ssid = "test";
 const char* password = "12345678";
 
 // Backend endpoints
-const char* backend_verify_url = "http://10.0.22.54:8000/api/verify-rfid";
-const char* backend_coffee_url = "http://10.0.22.54:8000/api/select-coffee";
+const char* backend_verify_url = "http://127.0.0.1:8000/api/verify-rfid";
+const char* backend_coffee_url = "http://127.0.0.1:8000/api/select-coffee";
 // Machine Location
 const char* machineLocation = "Office A - Floor 1";
 
